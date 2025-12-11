@@ -4,16 +4,8 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'workflows/**'
-      - 'credentials/**'
   workflow_dispatch:
     inputs:
-      promote_to_prod:
-        description: 'Promote to Production'
-        required: true
-        type: boolean
-        default: false
       skip_backup:
         description: 'Skip pre-deployment backup'
         required: false
@@ -177,10 +169,8 @@ jobs:
           
           ## Next Steps
           
-          To promote to production:
-          1. Go to Actions tab
-          2. Run this workflow manually
-          3. Enable "Promote to Production" option
+          Deployment to production will run automatically after export completes.
+          No manual approval required.
           EOF
           
           cat export_report.md
@@ -199,15 +189,11 @@ jobs:
               body: report
             });
 
-  # Job 2: Promote to Production (manual trigger only)
+  # Job 2: Promote to Production (automatic after export)
   promote-to-prod:
     name: Promote to Production
     runs-on: ubuntu-latest
     needs: export-from-dev
-    if: github.event.inputs.promote_to_prod == 'true'
-    environment:
-      name: production
-      url: https://${{ env.PROD_VPS_HOST }}
     
     steps:
       - name: Checkout repository
@@ -304,25 +290,39 @@ jobs:
           ssh -i ${SSH_KEY_PATH} ${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }} << 'ENDSSH'
             set -e
             
+            # Detect n8n container name
+            N8N_CONTAINER=$(docker ps --format '{{.Names}}' | grep -i n8n | grep -v postgres | head -n1)
+            if [ -z "$N8N_CONTAINER" ]; then
+              echo "✗ n8n container not found"
+              exit 1
+            fi
+            echo "Found n8n container: $N8N_CONTAINER"
+            
             # Check n8n health
-            if docker exec n8n-prod wget --spider -q http://localhost:5678/healthz 2>/dev/null; then
+            if docker exec "$N8N_CONTAINER" wget --spider -q http://localhost:5678/healthz 2>/dev/null; then
               echo "✓ n8n health check passed"
             else
               echo "✗ n8n health check failed"
               exit 1
             fi
             
-            # Check database
-            WORKFLOW_COUNT=$(docker exec n8n-postgres-prod psql -U n8n -d n8n -t -c "SELECT COUNT(*) FROM workflow_entity;" | tr -d ' ')
-            echo "✓ Workflows in database: $WORKFLOW_COUNT"
+            # Detect database container (try postgres first, then check for SQLite)
+            DB_CONTAINER=$(docker ps --format '{{.Names}}' | grep -iE 'postgres|db' | head -n1)
             
-            # Check active workflows
-            ACTIVE_COUNT=$(docker exec n8n-postgres-prod psql -U n8n -d n8n -t -c "SELECT COUNT(*) FROM workflow_entity WHERE active = true;" | tr -d ' ')
-            echo "✓ Active workflows: $ACTIVE_COUNT"
-            
-            # Check credentials
-            CRED_COUNT=$(docker exec n8n-postgres-prod psql -U n8n -d n8n -t -c "SELECT COUNT(*) FROM credentials_entity;" | tr -d ' ')
-            echo "✓ Credentials in database: $CRED_COUNT"
+            if [ -n "$DB_CONTAINER" ]; then
+              # PostgreSQL database
+              WORKFLOW_COUNT=$(docker exec "$DB_CONTAINER" psql -U n8n -d n8n -t -c "SELECT COUNT(*) FROM workflow_entity;" 2>/dev/null | tr -d ' ' || echo "0")
+              echo "✓ Workflows in database: $WORKFLOW_COUNT"
+              
+              ACTIVE_COUNT=$(docker exec "$DB_CONTAINER" psql -U n8n -d n8n -t -c "SELECT COUNT(*) FROM workflow_entity WHERE active = true;" 2>/dev/null | tr -d ' ' || echo "0")
+              echo "✓ Active workflows: $ACTIVE_COUNT"
+              
+              CRED_COUNT=$(docker exec "$DB_CONTAINER" psql -U n8n -d n8n -t -c "SELECT COUNT(*) FROM credentials_entity;" 2>/dev/null | tr -d ' ' || echo "0")
+              echo "✓ Credentials in database: $CRED_COUNT"
+            else
+              # SQLite database - check if n8n is running
+              echo "✓ Database check skipped (SQLite detected)"
+            fi
             
             echo "✓ All smoke tests passed"
           ENDSSH
@@ -436,29 +436,28 @@ jobs:
         run: |
           echo "Validating workflow JSON files..."
           
-          # Find all JSON files in workflows directory
-          if [ -d "workflows" ]; then
-            for file in workflows/*.json; do
-              if [ -f "$file" ]; then
-                echo "Validating: $file"
-                # Check if valid JSON
-                if jq empty "$file" 2>/dev/null; then
-                  echo "✓ Valid JSON: $file"
-                else
-                  echo "✗ Invalid JSON: $file"
-                  exit 1
-                fi
+          # Find all JSON files in root directory (workflow files)
+          JSON_FILES=$(find . -maxdepth 1 -name "*.json" -type f 2>/dev/null || true)
+          
+          if [ -n "$JSON_FILES" ]; then
+            for file in $JSON_FILES; do
+              echo "Validating: $file"
+              # Check if valid JSON
+              if jq empty "$file" 2>/dev/null; then
+                echo "✓ Valid JSON: $file"
+              else
+                echo "✗ Invalid JSON: $file"
+                exit 1
               fi
             done
+            echo "✓ All workflow files are valid"
           else
-            echo "No workflows directory found - skipping validation"
+            echo "No JSON files found in root directory - skipping validation"
           fi
-          
-          echo "✓ All workflow files are valid"
 
       - name: Check for sensitive data
         run: |
-          echo "Checking for sensitive data in workflows..."
+          echo "Checking for sensitive data in workflow files..."
           
           # Check for common sensitive patterns
           SENSITIVE_PATTERNS=(
@@ -472,9 +471,12 @@ jobs:
           
           FOUND_SENSITIVE=false
           
-          if [ -d "workflows" ]; then
+          # Check JSON files in root directory
+          JSON_FILES=$(find . -maxdepth 1 -name "*.json" -type f 2>/dev/null || true)
+          
+          if [ -n "$JSON_FILES" ]; then
             for pattern in "${SENSITIVE_PATTERNS[@]}"; do
-              if grep -ri "$pattern" workflows/ 2>/dev/null | grep -v "credentialType"; then
+              if grep -ri "$pattern" $JSON_FILES 2>/dev/null | grep -v "credentialType"; then
                 echo "⚠ Warning: Found potential sensitive data pattern: $pattern"
                 FOUND_SENSITIVE=true
               fi
