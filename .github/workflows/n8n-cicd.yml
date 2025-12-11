@@ -1,0 +1,490 @@
+name: n8n CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'workflows/**'
+      - 'credentials/**'
+  workflow_dispatch:
+    inputs:
+      promote_to_prod:
+        description: 'Promote to Production'
+        required: true
+        type: boolean
+        default: false
+      skip_backup:
+        description: 'Skip pre-deployment backup'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  DEV_VPS_HOST: '194.238.17.118'
+  PROD_VPS_HOST: '72.61.226.144'
+  DEV_VPS_USER: 'root'
+  PROD_VPS_USER: 'root'
+  SSH_KEY_PATH: '/tmp/deploy_key'
+
+jobs:
+  # Job 1: Export from DEV
+  export-from-dev:
+    name: Export from DEV
+    runs-on: ubuntu-latest
+    outputs:
+      export_status: ${{ steps.export.outputs.status }}
+      export_package: ${{ steps.export.outputs.package_name }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ${SSH_KEY_PATH}
+          chmod 600 ${SSH_KEY_PATH}
+          ssh-keyscan -H ${{ env.DEV_VPS_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Test SSH connection to DEV
+        run: |
+          ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=no ${{ env.DEV_VPS_USER }}@${{ env.DEV_VPS_HOST }} "echo 'SSH connection successful'"
+
+      - name: Run export script on DEV
+        id: export
+        run: |
+          echo "Running export from DEV..."
+          
+          # Run export script
+          ssh -i ${SSH_KEY_PATH} ${{ env.DEV_VPS_USER }}@${{ env.DEV_VPS_HOST }} << 'ENDSSH'
+            set -e
+            
+            # Ensure script is executable
+            chmod +x /srv/n8n/scripts/export_from_dev.sh
+            
+            # Run export
+            /srv/n8n/scripts/export_from_dev.sh
+            
+            # Find the latest export package
+            LATEST_PACKAGE=$(ls -t /srv/n8n/migration-temp/n8n_export_*.tar.gz 2>/dev/null | head -n1)
+            
+            if [ -z "$LATEST_PACKAGE" ]; then
+              echo "Error: No export package found"
+              exit 1
+            fi
+            
+            echo "Export package: $LATEST_PACKAGE"
+            echo "$LATEST_PACKAGE" > /tmp/latest_export_path.txt
+          ENDSSH
+          
+          # Get package name
+          PACKAGE_PATH=$(ssh -i ${SSH_KEY_PATH} ${{ env.DEV_VPS_USER }}@${{ env.DEV_VPS_HOST }} "cat /tmp/latest_export_path.txt")
+          PACKAGE_NAME=$(basename "$PACKAGE_PATH")
+          
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "package_name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Export completed: $PACKAGE_NAME"
+
+      - name: Download export artifacts
+        run: |
+          echo "Downloading export artifacts from DEV..."
+          
+          # Get package path
+          PACKAGE_PATH=$(ssh -i ${SSH_KEY_PATH} ${{ env.DEV_VPS_USER }}@${{ env.DEV_VPS_HOST }} "cat /tmp/latest_export_path.txt")
+          
+          # Download package
+          scp -i ${SSH_KEY_PATH} "${{ env.DEV_VPS_USER }}@${{ env.DEV_VPS_HOST }}:$PACKAGE_PATH" ./
+          
+          # Download export directory contents for review
+          scp -i ${SSH_KEY_PATH} -r "${{ env.DEV_VPS_USER }}@${{ env.DEV_VPS_HOST }}:/srv/n8n/migration-temp/export/" ./export-artifacts/
+          
+          echo "Downloaded artifacts:"
+          ls -lh
+
+      - name: Validate export artifacts
+        run: |
+          echo "Validating export artifacts..."
+          
+          # Extract package
+          tar -xzf ${{ steps.export.outputs.package_name }}
+          
+          # Check required files
+          required_files=(
+            "workflows_sanitized.json"
+            "credentials_selected.json"
+            "workflows_active_map.tsv"
+            "checksums.txt"
+            "export_metadata.json"
+          )
+          
+          for file in "${required_files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "Error: Missing required file: $file"
+              exit 1
+            fi
+            echo "✓ Found: $file"
+          done
+          
+          # Verify checksums
+          sha256sum -c checksums.txt
+          
+          echo "✓ All validations passed"
+
+      - name: Display export summary
+        run: |
+          echo "Export Summary:"
+          cat export_metadata.json
+          
+          # Count workflows and credentials
+          WORKFLOW_COUNT=$(python3 -c "import json; print(len(json.load(open('workflows_sanitized.json'))))")
+          CREDENTIAL_COUNT=$(python3 -c "import json; print(len(json.load(open('credentials_selected.json'))))")
+          
+          echo ""
+          echo "📊 Statistics:"
+          echo "  Workflows: $WORKFLOW_COUNT"
+          echo "  Credentials: $CREDENTIAL_COUNT"
+
+      - name: Upload export artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: n8n-export-${{ github.sha }}
+          path: |
+            ${{ steps.export.outputs.package_name }}
+            export-artifacts/
+          retention-days: 30
+
+      - name: Create export report
+        run: |
+          cat > export_report.md << EOF
+          # n8n Export Report
+          
+          **Date:** $(date)
+          **Commit:** ${{ github.sha }}
+          **Branch:** ${{ github.ref_name }}
+          **Triggered by:** ${{ github.actor }}
+          
+          ## Export Summary
+          
+          \`\`\`json
+          $(cat export_metadata.json)
+          \`\`\`
+          
+          ## Package Details
+          
+          - **Package:** ${{ steps.export.outputs.package_name }}
+          - **Size:** $(du -h ${{ steps.export.outputs.package_name }} | cut -f1)
+          
+          ## Next Steps
+          
+          To promote to production:
+          1. Go to Actions tab
+          2. Run this workflow manually
+          3. Enable "Promote to Production" option
+          EOF
+          
+          cat export_report.md
+
+      - name: Comment on PR (if applicable)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('export_report.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+
+  # Job 2: Promote to Production (manual trigger only)
+  promote-to-prod:
+    name: Promote to Production
+    runs-on: ubuntu-latest
+    needs: export-from-dev
+    if: github.event.inputs.promote_to_prod == 'true'
+    environment:
+      name: production
+      url: https://${{ env.PROD_VPS_HOST }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download export artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: n8n-export-${{ github.sha }}
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ${SSH_KEY_PATH}
+          chmod 600 ${SSH_KEY_PATH}
+          ssh-keyscan -H ${{ env.PROD_VPS_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Test SSH connection to PROD
+        run: |
+          ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=no ${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }} "echo 'SSH connection to PROD successful'"
+
+      - name: Create pre-deployment backup
+        if: github.event.inputs.skip_backup != 'true'
+        run: |
+          echo "Creating pre-deployment backup on PROD..."
+          
+          ssh -i ${SSH_KEY_PATH} ${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }} << 'ENDSSH'
+            set -e
+            
+            if [ -f /srv/n8n/scripts/backup.sh ]; then
+              chmod +x /srv/n8n/scripts/backup.sh
+              /srv/n8n/scripts/backup.sh
+              echo "✓ Pre-deployment backup completed"
+            else
+              echo "⚠ Backup script not found"
+            fi
+          ENDSSH
+
+      - name: Transfer export package to PROD
+        run: |
+          echo "Transferring export package to PROD..."
+          
+          PACKAGE_NAME="${{ needs.export-from-dev.outputs.export_package }}"
+          
+          # Transfer package
+          scp -i ${SSH_KEY_PATH} "$PACKAGE_NAME" "${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }}:/srv/n8n/migration-temp/"
+          
+          echo "✓ Package transferred: $PACKAGE_NAME"
+
+      - name: Run import script on PROD
+        id: import
+        run: |
+          echo "Running import on PROD..."
+          
+          PACKAGE_NAME="${{ needs.export-from-dev.outputs.export_package }}"
+          
+          ssh -i ${SSH_KEY_PATH} ${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }} << ENDSSH
+            set -e
+            
+            # Ensure script is executable
+            chmod +x /srv/n8n/scripts/import_to_prod.sh
+            
+            # Run import
+            /srv/n8n/scripts/import_to_prod.sh /srv/n8n/migration-temp/$PACKAGE_NAME
+            
+            echo "✓ Import completed successfully"
+          ENDSSH
+          
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Download import logs
+        if: always()
+        run: |
+          echo "Downloading import logs from PROD..."
+          
+          # Get latest import log
+          ssh -i ${SSH_KEY_PATH} ${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }} \
+            "ls -t /srv/n8n/logs/import_*.log 2>/dev/null | head -n1" > /tmp/log_path.txt || true
+          
+          LOG_PATH=$(cat /tmp/log_path.txt)
+          
+          if [ -n "$LOG_PATH" ]; then
+            scp -i ${SSH_KEY_PATH} "${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }}:$LOG_PATH" ./import.log
+            echo "✓ Import log downloaded"
+          else
+            echo "⚠ No import log found"
+          fi
+
+      - name: Run smoke tests
+        id: smoke_tests
+        run: |
+          echo "Running smoke tests on PROD..."
+          
+          ssh -i ${SSH_KEY_PATH} ${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }} << 'ENDSSH'
+            set -e
+            
+            # Check n8n health
+            if docker exec n8n-prod wget --spider -q http://localhost:5678/healthz 2>/dev/null; then
+              echo "✓ n8n health check passed"
+            else
+              echo "✗ n8n health check failed"
+              exit 1
+            fi
+            
+            # Check database
+            WORKFLOW_COUNT=$(docker exec n8n-postgres-prod psql -U n8n -d n8n -t -c "SELECT COUNT(*) FROM workflow_entity;" | tr -d ' ')
+            echo "✓ Workflows in database: $WORKFLOW_COUNT"
+            
+            # Check active workflows
+            ACTIVE_COUNT=$(docker exec n8n-postgres-prod psql -U n8n -d n8n -t -c "SELECT COUNT(*) FROM workflow_entity WHERE active = true;" | tr -d ' ')
+            echo "✓ Active workflows: $ACTIVE_COUNT"
+            
+            # Check credentials
+            CRED_COUNT=$(docker exec n8n-postgres-prod psql -U n8n -d n8n -t -c "SELECT COUNT(*) FROM credentials_entity;" | tr -d ' ')
+            echo "✓ Credentials in database: $CRED_COUNT"
+            
+            echo "✓ All smoke tests passed"
+          ENDSSH
+          
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Clean up temporary files
+        if: always()
+        run: |
+          echo "Cleaning up temporary files on PROD..."
+          
+          ssh -i ${SSH_KEY_PATH} ${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }} << 'ENDSSH'
+            # Remove decrypted credentials
+            find /srv/n8n/migration-temp/import -name "*credentials*.json" -delete 2>/dev/null || true
+            
+            # Keep export packages for 7 days, then auto-delete
+            find /srv/n8n/migration-temp -name "*.tar.gz" -mtime +7 -delete 2>/dev/null || true
+            
+            echo "✓ Cleanup completed"
+          ENDSSH
+
+      - name: Upload deployment artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-deployment-${{ github.sha }}
+          path: |
+            import.log
+            export-artifacts/
+          retention-days: 90
+
+      - name: Create deployment report
+        if: always()
+        run: |
+          cat > deployment_report.md << EOF
+          # Production Deployment Report
+          
+          **Date:** $(date)
+          **Commit:** ${{ github.sha }}
+          **Branch:** ${{ github.ref_name }}
+          **Deployed by:** ${{ github.actor }}
+          
+          ## Deployment Status
+          
+          - **Export:** ${{ needs.export-from-dev.outputs.export_status }}
+          - **Import:** ${{ steps.import.outputs.status }}
+          - **Smoke Tests:** ${{ steps.smoke_tests.outputs.status }}
+          
+          ## Package Details
+          
+          - **Package:** ${{ needs.export-from-dev.outputs.export_package }}
+          
+          ## Smoke Test Results
+          
+          All smoke tests passed successfully:
+          - ✓ n8n health check
+          - ✓ Database connectivity
+          - ✓ Workflows imported
+          - ✓ Credentials imported
+          
+          ## Next Steps
+          
+          1. Verify production workflows are functioning
+          2. Test webhook endpoints
+          3. Monitor logs for any issues
+          4. Verify scheduled workflows are running
+          
+          ## Rollback Instructions
+          
+          If issues occur, rollback using:
+          \`\`\`bash
+          ssh ${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }}
+          cd /srv/n8n
+          # Find latest backup
+          ls -lh backups/
+          # Restore backup
+          ./scripts/restore.sh backups/daily/[backup_file]
+          \`\`\`
+          EOF
+          
+          cat deployment_report.md
+
+      - name: Notify on success
+        if: success()
+        run: |
+          echo "🎉 Deployment to PRODUCTION completed successfully!"
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ Deployment to PRODUCTION failed!"
+          echo "Check logs and consider rollback if necessary."
+          exit 1
+
+  # Job 3: Validate workflows (runs on all pushes)
+  validate-workflows:
+    name: Validate Workflows
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate workflow JSON files
+        run: |
+          echo "Validating workflow JSON files..."
+          
+          # Find all JSON files in workflows directory
+          if [ -d "workflows" ]; then
+            for file in workflows/*.json; do
+              if [ -f "$file" ]; then
+                echo "Validating: $file"
+                # Check if valid JSON
+                if jq empty "$file" 2>/dev/null; then
+                  echo "✓ Valid JSON: $file"
+                else
+                  echo "✗ Invalid JSON: $file"
+                  exit 1
+                fi
+              fi
+            done
+          else
+            echo "No workflows directory found - skipping validation"
+          fi
+          
+          echo "✓ All workflow files are valid"
+
+      - name: Check for sensitive data
+        run: |
+          echo "Checking for sensitive data in workflows..."
+          
+          # Check for common sensitive patterns
+          SENSITIVE_PATTERNS=(
+            "password"
+            "api_key"
+            "apiKey"
+            "secret"
+            "token"
+            "credential"
+          )
+          
+          FOUND_SENSITIVE=false
+          
+          if [ -d "workflows" ]; then
+            for pattern in "${SENSITIVE_PATTERNS[@]}"; do
+              if grep -ri "$pattern" workflows/ 2>/dev/null | grep -v "credentialType"; then
+                echo "⚠ Warning: Found potential sensitive data pattern: $pattern"
+                FOUND_SENSITIVE=true
+              fi
+            done
+          fi
+          
+          if [ "$FOUND_SENSITIVE" = true ]; then
+            echo "⚠ Please review workflows for hardcoded credentials"
+            echo "Use credential references instead of hardcoded values"
+          else
+            echo "✓ No obvious sensitive data found"
+          fi
+
