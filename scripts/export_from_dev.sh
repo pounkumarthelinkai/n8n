@@ -203,27 +203,99 @@ prepare_export_directory() {
 export_workflows() {
     log "Exporting workflows from DEV..."
     
-    # Export workflows from database
-    docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -F"," -c \
-        "SELECT json_agg(row_to_json(t)) FROM (SELECT * FROM workflow_entity ORDER BY name) t;" \
-        > "${WORKFLOWS_RAW}"
+    local container=$(get_n8n_container_name)
+    local db_type=$(detect_database_type)
     
-    if [[ ! -s "${WORKFLOWS_RAW}" ]]; then
-        error "Failed to export workflows or no workflows found"
-        exit 1
+    if [[ "${db_type}" == "sqlite" ]]; then
+        log "Using SQLite mode - exporting via n8n CLI..."
+        
+        # Export workflows using n8n CLI
+        docker exec "${container}" n8n export:workflow --all --output=/tmp/workflows_export.json || {
+            error "Failed to export workflows via n8n CLI"
+            exit 1
+        }
+        
+        # Copy exported workflows out of container
+        docker cp "${container}:/tmp/workflows_export.json" "${WORKFLOWS_RAW}"
+        
+        # Clean up from container
+        docker exec "${container}" rm -f /tmp/workflows_export.json
+        
+        # Convert n8n export format to array format if needed
+        if ! python3 -c "import json; json.load(open('${WORKFLOWS_RAW}'))" 2>/dev/null; then
+            # If export is not valid JSON, try to fix it
+            python3 <<PYTHON_SCRIPT
+import json
+import sys
+
+try:
+    with open('${WORKFLOWS_RAW}', 'r') as f:
+        content = f.read().strip()
+        # Try to parse as JSON
+        if content.startswith('['):
+            workflows = json.loads(content)
+        else:
+            # If it's a single object, wrap in array
+            workflows = [json.loads(content)]
+        
+        with open('${WORKFLOWS_RAW}', 'w') as f:
+            json.dump(workflows, f, indent=2)
+except Exception as e:
+    print(f"Error processing workflows: {e}", file=sys.stderr)
+    sys.exit(1)
+PYTHON_SCRIPT
+        fi
+        
+        # Count workflows
+        WORKFLOW_COUNT=$(python3 -c "import json; print(len(json.load(open('${WORKFLOWS_RAW}'))))" 2>/dev/null || echo "0")
+        
+        # Create active state mapping from exported workflows
+        log "Creating workflow active state mapping..."
+        python3 <<PYTHON_SCRIPT
+import json
+import sys
+
+try:
+    with open('${WORKFLOWS_RAW}', 'r') as f:
+        workflows = json.load(f)
+    
+    with open('${WORKFLOWS_ACTIVE_MAP}', 'w') as f:
+        for wf in workflows:
+            name = wf.get('name', 'Unknown')
+            active = str(wf.get('active', False)).lower()
+            wf_id = wf.get('id', '')
+            f.write(f"{name}\t{active}\t{wf_id}\n")
+except Exception as e:
+    print(f"Error creating active map: {e}", file=sys.stderr)
+    sys.exit(1)
+PYTHON_SCRIPT
+        
+        log "Exported ${WORKFLOW_COUNT} workflows via n8n CLI"
+    else
+        log "Using PostgreSQL mode - exporting via database..."
+        
+        # Export workflows from PostgreSQL database
+        docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -F"," -c \
+            "SELECT json_agg(row_to_json(t)) FROM (SELECT * FROM workflow_entity ORDER BY name) t;" \
+            > "${WORKFLOWS_RAW}"
+        
+        if [[ ! -s "${WORKFLOWS_RAW}" ]]; then
+            error "Failed to export workflows or no workflows found"
+            exit 1
+        fi
+        
+        # Count workflows
+        WORKFLOW_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
+            "SELECT COUNT(*) FROM workflow_entity;")
+        
+        log "Exported ${WORKFLOW_COUNT} workflows"
+        
+        # Create active state mapping (workflow name -> active status)
+        log "Creating workflow active state mapping..."
+        docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -F$'\t' -c \
+            "SELECT name, active, id FROM workflow_entity ORDER BY name;" \
+            > "${WORKFLOWS_ACTIVE_MAP}"
     fi
-    
-    # Count workflows
-    WORKFLOW_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
-        "SELECT COUNT(*) FROM workflow_entity;")
-    
-    log "Exported ${WORKFLOW_COUNT} workflows"
-    
-    # Create active state mapping (workflow name -> active status)
-    log "Creating workflow active state mapping..."
-    docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -F$'\t' -c \
-        "SELECT name, active, id FROM workflow_entity ORDER BY name;" \
-        > "${WORKFLOWS_ACTIVE_MAP}"
     
     log "Active state mapping created"
 }
@@ -281,45 +353,63 @@ export_credentials() {
     log "Exporting credentials from DEV..."
     warning "Credentials will be temporarily DECRYPTED - handle with care"
     
+    local container=$(get_n8n_container_name)
+    local db_type=$(detect_database_type)
+    
     # Check if encryption key is available
-    source "${N8N_DIR}/.env"
-    if [[ -z "${N8N_ENCRYPTION_KEY:-}" ]]; then
-        error "N8N_ENCRYPTION_KEY not found in environment"
-        exit 1
+    if [[ -f "${N8N_DIR}/.env" ]]; then
+        source "${N8N_DIR}/.env"
     fi
     
-    # Export encrypted credentials from database
-    docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -F"," -c \
-        "SELECT json_agg(row_to_json(t)) FROM (SELECT * FROM credentials_entity ORDER BY name) t;" \
-        > "${CREDENTIALS_RAW}"
+    # Always use n8n CLI for credential export (works for both SQLite and PostgreSQL)
+    log "Exporting credentials via n8n CLI..."
     
+    # Use n8n's built-in export which handles decryption
+    docker exec "${container}" n8n export:credentials --all --output=/tmp/credentials_decrypted.json || {
+        warning "Failed to export credentials via n8n CLI, checking if any exist..."
+        echo "[]" > "${CREDENTIALS_RAW}"
+        return
+    }
+    
+    # Copy decrypted credentials out of container
+    docker cp "${container}:/tmp/credentials_decrypted.json" "${CREDENTIALS_RAW}"
+    
+    # Clean up from container
+    docker exec "${container}" rm -f /tmp/credentials_decrypted.json
+    
+    # Validate and count credentials
     if [[ ! -s "${CREDENTIALS_RAW}" ]]; then
         warning "No credentials found or failed to export"
         echo "[]" > "${CREDENTIALS_RAW}"
         return
     fi
     
-    CREDENTIAL_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
-        "SELECT COUNT(*) FROM credentials_entity;")
+    # Ensure valid JSON array
+    if ! python3 -c "import json; json.load(open('${CREDENTIALS_RAW}'))" 2>/dev/null; then
+        python3 <<PYTHON_SCRIPT
+import json
+import sys
+
+try:
+    with open('${CREDENTIALS_RAW}', 'r') as f:
+        content = f.read().strip()
+        if content.startswith('['):
+            creds = json.loads(content)
+        else:
+            creds = [json.loads(content)]
+        
+        with open('${CREDENTIALS_RAW}', 'w') as f:
+            json.dump(creds, f, indent=2)
+except Exception as e:
+    print(f"Error processing credentials: {e}", file=sys.stderr)
+    with open('${CREDENTIALS_RAW}', 'w') as f:
+        json.dump([], f)
+PYTHON_SCRIPT
+    fi
     
-    log "Exported ${CREDENTIAL_COUNT} credentials (encrypted)"
+    CREDENTIAL_COUNT=$(python3 -c "import json; print(len(json.load(open('${CREDENTIALS_RAW}'))))" 2>/dev/null || echo "0")
     
-    # Decrypt credentials using n8n CLI
-    log "Decrypting credentials..."
-    
-    # Use n8n's built-in export which handles decryption
-    docker exec -e N8N_ENCRYPTION_KEY="${N8N_ENCRYPTION_KEY}" n8n-dev \
-        n8n export:credentials --all --output=/tmp/credentials_decrypted.json || {
-            error "Failed to decrypt credentials"
-            exit 1
-        }
-    
-    # Copy decrypted credentials out of container
-    docker cp n8n-dev:/tmp/credentials_decrypted.json "${CREDENTIALS_RAW}"
-    
-    # Clean up from container
-    docker exec n8n-dev rm -f /tmp/credentials_decrypted.json
-    
+    log "Exported ${CREDENTIAL_COUNT} credentials (decrypted)"
     log "Credentials decrypted successfully"
 }
 
@@ -413,6 +503,7 @@ generate_checksums() {
 create_metadata() {
     log "Creating export metadata..."
     
+    local container=$(get_n8n_container_name)
     WORKFLOW_COUNT=$(python3 -c "import json; print(len(json.load(open('${WORKFLOWS_SANITIZED}'))))")
     CREDENTIAL_COUNT=$(python3 -c "import json; print(len(json.load(open('${CREDENTIALS_SELECTED}'))))")
     ACTIVE_WORKFLOW_COUNT=$(grep -c $'\ttrue\t' "${WORKFLOWS_ACTIVE_MAP}" || echo "0")
@@ -425,7 +516,7 @@ create_metadata() {
   "workflow_count": ${WORKFLOW_COUNT},
   "credential_count": ${CREDENTIAL_COUNT},
   "active_workflow_count": ${ACTIVE_WORKFLOW_COUNT},
-  "n8n_version": "$(docker exec n8n-dev n8n --version | head -n1 || echo 'unknown')",
+  "n8n_version": "$(docker exec ${container} n8n --version 2>/dev/null | head -n1 || echo 'unknown')",
   "export_script_version": "1.0.0"
 }
 EOF
