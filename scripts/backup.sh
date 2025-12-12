@@ -48,7 +48,7 @@ FULL_DB_MODE=false
 
 # Logging functions
 log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1" | tee -a "${LOG_FILE}"
+    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1" | tee -a "${LOG_FILE}" >&2
 }
 
 error() {
@@ -56,7 +56,7 @@ error() {
 }
 
 warning() {
-    echo -e "${YELLOW}[$(date +'%Y-%m-%d %H:%M:%S')] WARNING:${NC} $1" | tee -a "${LOG_FILE}"
+    echo -e "${YELLOW}[$(date +'%Y-%m-%d %H:%M:%S')] WARNING:${NC} $1" | tee -a "${LOG_FILE}" >&2
 }
 
 # Detect environment
@@ -180,13 +180,13 @@ backup_sqlite_database() {
     docker run --rm -v "${volume}:/data" -v "${BACKUP_DIR}/${BACKUP_TYPE}:/backup" \
         alpine:latest sh -c "apk add --no-cache sqlite > /dev/null 2>&1 && \
         if [ -f /data/.n8n/database.sqlite ]; then
-            echo .backup /backup/${BACKUP_FILENAME} | sqlite3 /data/.n8n/database.sqlite && \
-            echo Backup created successfully
+            echo .backup /backup/${BACKUP_FILENAME} | sqlite3 /data/.n8n/database.sqlite > /dev/null 2>&1 && \
+            echo Backup created successfully >&2
         elif [ -f /data/database.sqlite ]; then
-            echo .backup /backup/${BACKUP_FILENAME} | sqlite3 /data/database.sqlite && \
-            echo Backup created successfully
+            echo .backup /backup/${BACKUP_FILENAME} | sqlite3 /data/database.sqlite > /dev/null 2>&1 && \
+            echo Backup created successfully >&2
         else
-            echo 'Error: database.sqlite not found in expected locations'
+            echo 'Error: database.sqlite not found in expected locations' >&2
             exit 1
         fi" || {
         error "Failed to create SQLite backup"
@@ -487,8 +487,11 @@ main() {
     # Prepare backup directory
     prepare_backup_directory
     
-    # Perform backup
-    BACKUP_FILE=$(backup_database "${ENV}")
+    # Perform backup (capture only the last line which should be the file path)
+    BACKUP_FILE=$(backup_database "${ENV}" 2>&1 | tail -n1)
+    
+    # Clean up any log messages that might have been captured
+    BACKUP_FILE=$(echo "${BACKUP_FILE}" | grep -E '^/' || echo "${BACKUP_FILE}")
     
     # Verify backup
     if verify_backup "${BACKUP_FILE}"; then
