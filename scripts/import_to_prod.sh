@@ -480,20 +480,22 @@ import_credentials() {
     
     log "Importing ${CREDENTIAL_COUNT} credentials..."
     
+    local container=$(get_n8n_container_name)
+    
     # Copy credentials to container
-    docker cp "${CREDENTIALS_SELECTED}" n8n-prod:/tmp/credentials_to_import.json
+    docker cp "${CREDENTIALS_SELECTED}" "${container}:/tmp/credentials_to_import.json"
     
     # Import credentials using n8n CLI (will re-encrypt with PROD key)
     source "${N8N_DIR}/.env"
-    docker exec -e N8N_ENCRYPTION_KEY="${N8N_ENCRYPTION_KEY}" n8n-prod \
+    docker exec -e N8N_ENCRYPTION_KEY="${N8N_ENCRYPTION_KEY}" "${container}" \
         n8n import:credentials --input=/tmp/credentials_to_import.json || {
             error "Failed to import credentials"
-            docker exec n8n-prod rm -f /tmp/credentials_to_import.json
+            docker exec "${container}" rm -f /tmp/credentials_to_import.json
             exit 1
         }
     
     # Clean up from container
-    docker exec n8n-prod rm -f /tmp/credentials_to_import.json
+    docker exec "${container}" rm -f /tmp/credentials_to_import.json
     
     log "Credentials imported and re-encrypted with PROD key"
 }
@@ -516,19 +518,21 @@ import_workflows() {
     
     log "Importing ${WORKFLOW_COUNT} workflows (all inactive)..."
     
+    local container=$(get_n8n_container_name)
+    
     # Copy workflows to container
-    docker cp "${WORKFLOWS_SANITIZED}" n8n-prod:/tmp/workflows_to_import.json
+    docker cp "${WORKFLOWS_SANITIZED}" "${container}:/tmp/workflows_to_import.json"
     
     # Import workflows using n8n CLI
-    docker exec n8n-prod \
+    docker exec "${container}" \
         n8n import:workflow --input=/tmp/workflows_to_import.json --separate || {
             error "Failed to import workflows"
-            docker exec n8n-prod rm -f /tmp/workflows_to_import.json
+            docker exec "${container}" rm -f /tmp/workflows_to_import.json
             exit 1
         }
     
     # Clean up from container
-    docker exec n8n-prod rm -f /tmp/workflows_to_import.json
+    docker exec "${container}" rm -f /tmp/workflows_to_import.json
     
     log "Workflows imported successfully (all inactive)"
 }
@@ -657,7 +661,8 @@ toggle_webhook_workflows() {
     
     # Restart n8n to ensure webhooks are registered
     log "Restarting n8n to register webhooks..."
-    docker restart n8n-prod
+    local container=$(get_n8n_container_name)
+    docker restart "${container}"
     sleep 10
     
     log "Webhook workflows toggled and registered"
@@ -683,7 +688,8 @@ verify_import() {
     log "  - ${PROD_CREDENTIAL_COUNT} credentials"
     
     # Check if n8n is healthy
-    if docker exec n8n-prod wget --spider -q http://localhost:5678/healthz 2>/dev/null; then
+    local container=$(get_n8n_container_name)
+    if docker exec "${container}" wget --spider -q http://localhost:5678/healthz 2>/dev/null; then
         log "n8n health check passed"
     else
         error "n8n health check failed"
@@ -706,6 +712,7 @@ create_import_report() {
     PROD_CREDENTIAL_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
         "SELECT COUNT(*) FROM credentials_entity;")
     
+    local container=$(get_n8n_container_name)
     cat > "${IMPORT_REPORT}" <<EOF
 {
   "import_timestamp": "$(date -Iseconds)",
@@ -714,7 +721,7 @@ create_import_report() {
   "workflows_imported": ${PROD_WORKFLOW_COUNT},
   "workflows_activated": ${PROD_ACTIVE_COUNT},
   "credentials_imported": ${PROD_CREDENTIAL_COUNT},
-  "n8n_version": "$(docker exec n8n-prod n8n --version | head -n1 || echo 'unknown')",
+  "n8n_version": "$(docker exec ${container} n8n --version 2>/dev/null | head -n1 || echo 'unknown')",
   "import_script_version": "1.0.0",
   "status": "success"
 }
