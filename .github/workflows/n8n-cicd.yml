@@ -1,6 +1,9 @@
 name: n8n CI/CD Pipeline
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       promote_to_prod:
@@ -25,7 +28,7 @@ jobs:
   deploy:
     name: Deploy to Production
     runs-on: ubuntu-latest
-    if: github.event.inputs.promote_to_prod == 'true'
+    if: github.event.inputs.promote_to_prod == 'true' || github.event_name == 'push'
     
     steps:
       - name: Setup SSH key
@@ -45,8 +48,27 @@ jobs:
             echo "✓ Export completed on DEV"
           ENDSSH
 
+      - name: Fetch latest package path from DEV
+        id: fetch_latest
+        run: |
+          LATEST_PACKAGE=$(ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=no ${{ env.DEV_VPS_USER }}@${{ env.DEV_VPS_HOST }} "ls -t /srv/n8n/migration-temp/n8n_export_*.tar.gz 2>/dev/null | head -n1")
+          if [ -z "$LATEST_PACKAGE" ]; then
+            echo "No export package found on DEV. Please run export script manually."
+            exit 1
+          fi
+          echo "package_path=$LATEST_PACKAGE" >> $GITHUB_OUTPUT
+          echo "package_name=$(basename $LATEST_PACKAGE)" >> $GITHUB_OUTPUT
+
+      - name: Copy package from DEV to PROD
+        run: |
+          PACKAGE_PATH="${{ steps.fetch_latest.outputs.package_path }}"
+          PACKAGE_NAME="${{ steps.fetch_latest.outputs.package_name }}"
+          echo "Copying $PACKAGE_NAME from DEV to PROD..."
+          scp -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=no "${{ env.DEV_VPS_USER }}@${{ env.DEV_VPS_HOST }}:${PACKAGE_PATH}" "${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }}:/srv/n8n/migration-temp/${PACKAGE_NAME}"
+
       - name: Trigger import on PROD
         run: |
+          PACKAGE_NAME="${{ steps.fetch_latest.outputs.package_name }}"
           ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=no ${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }} << 'ENDSSH'
             set -e
             chmod +x /srv/n8n/scripts/import_to_prod.sh
@@ -60,8 +82,8 @@ jobs:
               fi
             fi
             
-            # Run import script (it will auto-fetch from DEV)
-            /srv/n8n/scripts/import_to_prod.sh
+            # Run import script with package path (already copied)
+            /srv/n8n/scripts/import_to_prod.sh /srv/n8n/migration-temp/${PACKAGE_NAME}
             
             echo "✓ Import completed on PROD"
           ENDSSH
