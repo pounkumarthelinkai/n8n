@@ -69,6 +69,7 @@ IMPORT_REPORT="${IMPORT_DIR}/import_report.json"
 DB_CONTAINER="n8n-postgres-prod"
 DB_USER="n8n"
 DB_NAME="n8n"
+DB_TYPE=""  # Will be detected: "sqlite" or "postgres"
 
 # Full database transfer mode flag
 FULL_DB_MODE=false
@@ -214,6 +215,28 @@ chown 1000:1000 /data/config && chmod 600 /data/config" || {
     log "Encryption key synchronized successfully"
 }
 
+# Detect database type (SQLite or PostgreSQL)
+detect_database_type() {
+    local container=$(get_n8n_container_name)
+    
+    # Check if SQLite database file exists
+    if docker exec "${container}" test -f /home/node/.n8n/database.sqlite 2>/dev/null; then
+        echo "sqlite"
+    # Check for PostgreSQL container
+    elif docker ps --format '{{.Names}}' | grep -qE "postgres|${DB_CONTAINER}"; then
+        # Try to find the actual postgres container name
+        local pg_container=$(docker ps --format '{{.Names}}' | grep -E "postgres|${DB_CONTAINER}" | head -n1)
+        if [[ -n "${pg_container}" ]]; then
+            DB_CONTAINER="${pg_container}"
+            echo "postgres"
+        else
+            echo "sqlite"  # Default to SQLite if can't find postgres
+        fi
+    else
+        echo "sqlite"  # Default to SQLite if can't determine
+    fi
+}
+
 # Check if running on correct environment
 check_environment() {
     production_warning "Checking PRODUCTION environment..."
@@ -232,11 +255,15 @@ check_environment() {
         exit 1
     fi
     
-    # For PostgreSQL mode, check if postgres container is running
-    if [[ "${FULL_DB_MODE}" == "false" ]]; then
-        if ! docker ps | grep -q "${DB_CONTAINER}"; then
-            warning "Postgres container ${DB_CONTAINER} not found, assuming SQLite mode"
-        fi
+    # Detect database type
+    DB_TYPE=$(detect_database_type)
+    if [[ "${DB_TYPE}" == "sqlite" ]]; then
+        log "Detected SQLite database mode"
+    elif [[ "${DB_TYPE}" == "postgres" ]]; then
+        log "Detected PostgreSQL database mode (container: ${DB_CONTAINER})"
+    else
+        warning "Could not detect database type, defaulting to SQLite"
+        DB_TYPE="sqlite"
     fi
     
     production_warning "Environment check passed - PRODUCTION environment confirmed"
@@ -558,10 +585,25 @@ import_workflows() {
 create_workflow_id_mapping() {
     log "Creating workflow ID mapping..."
     
-    # Get current workflows in PROD with their new IDs
-    docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -F$'\t' -c \
-        "SELECT name, id FROM workflow_entity ORDER BY name;" \
-        > "${WORKFLOW_ID_MAP}"
+    local container=$(get_n8n_container_name)
+    
+    if [[ "${DB_TYPE}" == "sqlite" ]]; then
+        # SQLite mode: query database file directly
+        docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
+            "SELECT name, id FROM workflow_entity ORDER BY name;" \
+            > "${WORKFLOW_ID_MAP}" 2>/dev/null || {
+            error "Failed to create workflow ID mapping from SQLite"
+            exit 1
+        }
+    else
+        # PostgreSQL mode
+        docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -F$'\t' -c \
+            "SELECT name, id FROM workflow_entity ORDER BY name;" \
+            > "${WORKFLOW_ID_MAP}" || {
+            error "Failed to create workflow ID mapping from PostgreSQL"
+            exit 1
+        }
+    fi
     
     log "Workflow ID mapping created"
 }
@@ -586,9 +628,11 @@ activate_workflows() {
     production_warning "Activating ${ACTIVE_COUNT} workflows in PROD..."
     
     # Use Python to process and activate
+    local container=$(get_n8n_container_name)
     python3 <<PYTHON_SCRIPT
 import sys
 import subprocess
+import os
 
 try:
     # Read active state from DEV
@@ -612,21 +656,34 @@ try:
     
     # Activate workflows
     activated = 0
+    db_type = '${DB_TYPE}'
+    container = '${container}'
+    db_container = '${DB_CONTAINER}'
+    db_user = '${DB_USER}'
+    db_name = '${DB_NAME}'
+    
     for name in active_workflows:
         if name in workflow_ids:
             workflow_id = workflow_ids[name]
             # Update database to set active=true
-            cmd = [
-                'docker', 'exec', '${DB_CONTAINER}',
-                'psql', '-U', '${DB_USER}', '-d', '${DB_NAME}', '-c',
-                f"UPDATE workflow_entity SET active = true WHERE id = {workflow_id};"
-            ]
+            if db_type == 'sqlite':
+                cmd = [
+                    'docker', 'exec', container,
+                    'sqlite3', '/home/node/.n8n/database.sqlite',
+                    f"UPDATE workflow_entity SET active = 1 WHERE id = '{workflow_id}';"
+                ]
+            else:
+                cmd = [
+                    'docker', 'exec', db_container,
+                    'psql', '-U', db_user, '-d', db_name, '-c',
+                    f"UPDATE workflow_entity SET active = true WHERE id = '{workflow_id}';"
+                ]
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode == 0:
                 print(f"Activated: {name} (ID: {workflow_id})")
                 activated += 1
             else:
-                print(f"Failed to activate: {name}", file=sys.stderr)
+                print(f"Failed to activate: {name} - {result.stderr}", file=sys.stderr)
         else:
             print(f"Workflow not found in PROD: {name}", file=sys.stderr)
     
@@ -649,10 +706,18 @@ PYTHON_SCRIPT
 toggle_webhook_workflows() {
     log "Toggling webhook-based workflows for registration..."
     
+    local container=$(get_n8n_container_name)
+    
     # Get list of active workflows with webhooks
-    WEBHOOK_WORKFLOW_IDS=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
-        "SELECT DISTINCT w.id FROM workflow_entity w WHERE w.active = true AND w.nodes::text LIKE '%\"type\":\"n8n-nodes-base.webhook\"%';" \
-        || echo "")
+    if [[ "${DB_TYPE}" == "sqlite" ]]; then
+        WEBHOOK_WORKFLOW_IDS=$(docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
+            "SELECT DISTINCT id FROM workflow_entity WHERE active = 1 AND nodes LIKE '%\"type\":\"n8n-nodes-base.webhook\"%';" \
+            2>/dev/null || echo "")
+    else
+        WEBHOOK_WORKFLOW_IDS=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
+            "SELECT DISTINCT w.id FROM workflow_entity w WHERE w.active = true AND w.nodes::text LIKE '%\"type\":\"n8n-nodes-base.webhook\"%';" \
+            || echo "")
+    fi
     
     if [[ -z "${WEBHOOK_WORKFLOW_IDS}" ]]; then
         log "No webhook workflows to toggle"
@@ -665,20 +730,29 @@ toggle_webhook_workflows() {
     # Toggle each webhook workflow (deactivate then reactivate)
     while IFS= read -r WORKFLOW_ID; do
         if [[ -n "${WORKFLOW_ID}" ]]; then
-            # Deactivate
-            docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -c \
-                "UPDATE workflow_entity SET active = false WHERE id = ${WORKFLOW_ID};" > /dev/null
-            sleep 1
-            # Reactivate
-            docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -c \
-                "UPDATE workflow_entity SET active = true WHERE id = ${WORKFLOW_ID};" > /dev/null
+            if [[ "${DB_TYPE}" == "sqlite" ]]; then
+                # Deactivate
+                docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
+                    "UPDATE workflow_entity SET active = 0 WHERE id = '${WORKFLOW_ID}';" > /dev/null 2>&1
+                sleep 1
+                # Reactivate
+                docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
+                    "UPDATE workflow_entity SET active = 1 WHERE id = '${WORKFLOW_ID}';" > /dev/null 2>&1
+            else
+                # Deactivate
+                docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -c \
+                    "UPDATE workflow_entity SET active = false WHERE id = ${WORKFLOW_ID};" > /dev/null
+                sleep 1
+                # Reactivate
+                docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -c \
+                    "UPDATE workflow_entity SET active = true WHERE id = ${WORKFLOW_ID};" > /dev/null
+            fi
             log "Toggled webhook workflow ID: ${WORKFLOW_ID}"
         fi
     done <<< "${WEBHOOK_WORKFLOW_IDS}"
     
     # Restart n8n to ensure webhooks are registered
     log "Restarting n8n to register webhooks..."
-    local container=$(get_n8n_container_name)
     docker restart "${container}"
     sleep 10
     
@@ -689,15 +763,28 @@ toggle_webhook_workflows() {
 verify_import() {
     log "Verifying import..."
     
+    local container=$(get_n8n_container_name)
+    
     # Count workflows in PROD
-    PROD_WORKFLOW_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
-        "SELECT COUNT(*) FROM workflow_entity;")
-    
-    PROD_ACTIVE_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
-        "SELECT COUNT(*) FROM workflow_entity WHERE active = true;")
-    
-    PROD_CREDENTIAL_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
-        "SELECT COUNT(*) FROM credentials_entity;")
+    if [[ "${DB_TYPE}" == "sqlite" ]]; then
+        PROD_WORKFLOW_COUNT=$(docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
+            "SELECT COUNT(*) FROM workflow_entity;" 2>/dev/null || echo "0")
+        
+        PROD_ACTIVE_COUNT=$(docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
+            "SELECT COUNT(*) FROM workflow_entity WHERE active = 1;" 2>/dev/null || echo "0")
+        
+        PROD_CREDENTIAL_COUNT=$(docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
+            "SELECT COUNT(*) FROM credentials_entity;" 2>/dev/null || echo "0")
+    else
+        PROD_WORKFLOW_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
+            "SELECT COUNT(*) FROM workflow_entity;")
+        
+        PROD_ACTIVE_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
+            "SELECT COUNT(*) FROM workflow_entity WHERE active = true;")
+        
+        PROD_CREDENTIAL_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
+            "SELECT COUNT(*) FROM credentials_entity;")
+    fi
     
     log "PROD now has:"
     log "  - ${PROD_WORKFLOW_COUNT} total workflows"
@@ -720,14 +807,27 @@ verify_import() {
 create_import_report() {
     log "Creating import report..."
     
-    PROD_WORKFLOW_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
-        "SELECT COUNT(*) FROM workflow_entity;")
+    local container=$(get_n8n_container_name)
     
-    PROD_ACTIVE_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
-        "SELECT COUNT(*) FROM workflow_entity WHERE active = true;")
-    
-    PROD_CREDENTIAL_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
-        "SELECT COUNT(*) FROM credentials_entity;")
+    if [[ "${DB_TYPE}" == "sqlite" ]]; then
+        PROD_WORKFLOW_COUNT=$(docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
+            "SELECT COUNT(*) FROM workflow_entity;" 2>/dev/null || echo "0")
+        
+        PROD_ACTIVE_COUNT=$(docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
+            "SELECT COUNT(*) FROM workflow_entity WHERE active = 1;" 2>/dev/null || echo "0")
+        
+        PROD_CREDENTIAL_COUNT=$(docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
+            "SELECT COUNT(*) FROM credentials_entity;" 2>/dev/null || echo "0")
+    else
+        PROD_WORKFLOW_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
+            "SELECT COUNT(*) FROM workflow_entity;")
+        
+        PROD_ACTIVE_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
+            "SELECT COUNT(*) FROM workflow_entity WHERE active = true;")
+        
+        PROD_CREDENTIAL_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
+            "SELECT COUNT(*) FROM credentials_entity;")
+    fi
     
     local container=$(get_n8n_container_name)
     cat > "${IMPORT_REPORT}" <<EOF
