@@ -767,12 +767,20 @@ try:
                     active_workflows.add(name)
     
     # Read workflow IDs from PROD
+    # Note: workflow_id_mapping.tsv uses | separator, not tab
     workflow_ids = {}
     with open('${WORKFLOW_ID_MAP}', 'r') as f:
         for line in f:
-            parts = line.strip().split('\t')
+            line = line.strip()
+            if not line:
+                continue
+            # Try pipe separator first (used by SQLite query), then tab
+            if '|' in line:
+                parts = line.split('|', 1)
+            else:
+                parts = line.split('\t', 1)
             if len(parts) >= 2:
-                name, workflow_id = parts[0], parts[1]
+                name, workflow_id = parts[0].strip(), parts[1].strip()
                 workflow_ids[name] = workflow_id
     
     # Activate workflows
