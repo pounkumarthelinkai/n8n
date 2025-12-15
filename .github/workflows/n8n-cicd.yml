@@ -64,6 +64,8 @@ jobs:
           PACKAGE_PATH="${{ steps.fetch_latest.outputs.package_path }}"
           PACKAGE_NAME="${{ steps.fetch_latest.outputs.package_name }}"
           echo "Copying $PACKAGE_NAME from DEV to PROD..."
+          # Ensure destination directory exists on PROD
+          ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=no ${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }} "mkdir -p /srv/n8n/migration-temp"
           scp -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=no "${{ env.DEV_VPS_USER }}@${{ env.DEV_VPS_HOST }}:${PACKAGE_PATH}" "${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }}:/srv/n8n/migration-temp/${PACKAGE_NAME}"
 
       - name: Trigger import on PROD
