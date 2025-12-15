@@ -318,6 +318,7 @@ try:
         sys.exit(0)
     
     # Set all workflows to inactive and remove IDs
+    # Preserve owner/project information for proper assignment
     sanitized_count = 0
     for workflow in workflows:
         # Set inactive
@@ -327,7 +328,10 @@ try:
         if 'id' in workflow:
             del workflow['id']
         
-        # Preserve all other fields including settings
+        # Preserve owner/project information (projectId, project) if present
+        # This ensures workflows are assigned to correct user/project
+        # Note: n8n CLI import may still assign to current user, but we preserve the data
+        
         sanitized_count += 1
     
     with open('${WORKFLOWS_SANITIZED}', 'w') as f:

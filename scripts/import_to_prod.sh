@@ -788,11 +788,16 @@ try:
             workflow_id = workflow_ids[name]
             # Update database to set active=true
             if db_type == 'sqlite':
+                # Try both database paths
                 cmd = [
                     'docker', 'run', '--rm', '-v', f'{volume}:/data',
                     'alpine:latest', 'sh', '-c',
                     f"apk add --no-cache sqlite > /dev/null 2>&1 && "
-                    f"sqlite3 /data/database.sqlite \"UPDATE workflow_entity SET active = 1 WHERE id = '{workflow_id}';\""
+                    f"if [ -f /data/.n8n/database.sqlite ]; then "
+                    f"sqlite3 /data/.n8n/database.sqlite \"UPDATE workflow_entity SET active = 1 WHERE id = '{workflow_id}';\" 2>/dev/null; "
+                    f"elif [ -f /data/database.sqlite ]; then "
+                    f"sqlite3 /data/database.sqlite \"UPDATE workflow_entity SET active = 1 WHERE id = '{workflow_id}';\" 2>/dev/null; "
+                    f"fi"
                 ]
             else:
                 cmd = [
