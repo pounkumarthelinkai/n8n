@@ -625,9 +625,10 @@ import_workflows() {
     fi
     
     # Now import all workflows (they should all import successfully since we cleared everything)
+    # n8n import:workflow --separate expects a directory, so we need to import the file directly
     log "Importing workflows..."
     IMPORT_OUTPUT=$(docker exec "${container}" \
-        n8n import:workflow --input=/tmp/workflows_to_import.json --separate 2>&1) || {
+        n8n import:workflow --input=/tmp/workflows_to_import.json 2>&1) || {
         error "Failed to import workflows"
         error "Import output: ${IMPORT_OUTPUT}"
         # Try to clean up with root user if needed
