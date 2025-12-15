@@ -71,25 +71,25 @@ jobs:
       - name: Trigger import on PROD
         run: |
           PACKAGE_NAME="${{ steps.fetch_latest.outputs.package_name }}"
-          ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=no ${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }} << "ENDSSH"
+          ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=no ${{ env.PROD_VPS_USER }}@${{ env.PROD_VPS_HOST }} "
             set -e
-            PACKAGE_NAME="${PACKAGE_NAME}"
+            PACKAGE_NAME='${PACKAGE_NAME}'
             chmod +x /srv/n8n/scripts/import_to_prod.sh
             
             # Skip backup if requested
-            SKIP_BACKUP="${{ github.event.inputs.skip_backup }}"
-            if [ "$SKIP_BACKUP" != "true" ]; then
+            SKIP_BACKUP='${{ github.event.inputs.skip_backup }}'
+            if [ \"$SKIP_BACKUP\" != \"true\" ]; then
               if [ -f /srv/n8n/scripts/backup.sh ]; then
                 chmod +x /srv/n8n/scripts/backup.sh
-                /srv/n8n/scripts/backup.sh || echo "⚠ Backup failed, continuing..."
+                /srv/n8n/scripts/backup.sh || echo '⚠ Backup failed, continuing...'
               fi
             fi
             
             # Run import script with package path (already copied)
             /srv/n8n/scripts/import_to_prod.sh /srv/n8n/migration-temp/${PACKAGE_NAME}
             
-            echo "✓ Import completed on PROD"
-          ENDSSH
+            echo '✓ Import completed on PROD'
+          "
 
       - name: Verify deployment
         run: |
