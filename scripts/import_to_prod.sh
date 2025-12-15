@@ -1192,6 +1192,7 @@ main() {
         import_workflows
         create_workflow_id_mapping
         activate_workflows
+        restore_workflow_ownership
         toggle_webhook_workflows
         verify_import
         create_import_report
