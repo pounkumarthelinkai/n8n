@@ -586,67 +586,45 @@ import_workflows() {
     log "Workflows in PROD before import: ${COUNT_BEFORE}"
     
     # Import workflows individually to catch errors and handle duplicates
-    # First, delete existing workflows with matching names to avoid duplicates
-    log "Checking for existing workflows to avoid duplicates..."
+    # First, delete ALL existing workflows to ensure clean import
+    log "Deleting all existing workflows to ensure clean import..."
     
-    # Get list of workflow names from import package
-    EXISTING_NAMES=$(docker exec "${container}" python3 -c \
-        "import json; wfs=json.load(open('/tmp/workflows_to_import.json')); print('\n'.join([w.get('name','') for w in wfs]))" 2>/dev/null || echo "")
-    
-    # Delete existing workflows with same names (to allow re-import)
-    DELETED_COUNT=0
-    if [[ -n "${EXISTING_NAMES}" ]]; then
-        while IFS= read -r wf_name; do
-            if [[ -z "${wf_name}" ]]; then
-                continue
-            fi
-            
-            # Escape single quotes for SQL
-            ESCAPED_NAME=$(echo "${wf_name}" | sed "s/'/''/g")
-            
-            if [[ "${DB_TYPE}" == "sqlite" ]]; then
-                local volume=$(get_n8n_volume_name)
-                # Check if workflow exists
-                EXISTS=$(docker run --rm -v "${volume}:/data" alpine:latest sh -c \
-                    "apk add --no-cache sqlite > /dev/null 2>&1 && \
-                    if [ -f /data/.n8n/database.sqlite ]; then \
-                        sqlite3 /data/.n8n/database.sqlite \"SELECT COUNT(*) FROM workflow_entity WHERE name = '${ESCAPED_NAME}';\" 2>/dev/null; \
-                    elif [ -f /data/database.sqlite ]; then \
-                        sqlite3 /data/database.sqlite \"SELECT COUNT(*) FROM workflow_entity WHERE name = '${ESCAPED_NAME}';\" 2>/dev/null; \
-                    else \
-                        echo '0'; \
-                    fi" | tr -d ' ' || echo "0")
-                
-                if [[ "${EXISTS}" != "0" ]]; then
-                    # Delete existing workflow
-                    docker run --rm -v "${volume}:/data" alpine:latest sh -c \
-                        "apk add --no-cache sqlite > /dev/null 2>&1 && \
-                        if [ -f /data/.n8n/database.sqlite ]; then \
-                            sqlite3 /data/.n8n/database.sqlite \"DELETE FROM workflow_entity WHERE name = '${ESCAPED_NAME}';\" 2>/dev/null; \
-                        elif [ -f /data/database.sqlite ]; then \
-                            sqlite3 /data/database.sqlite \"DELETE FROM workflow_entity WHERE name = '${ESCAPED_NAME}';\" 2>/dev/null; \
-                        fi" > /dev/null 2>&1
-                    ((DELETED_COUNT++)) || true
-                fi
-            else
-                # PostgreSQL mode
-                EXISTS=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
-                    "SELECT COUNT(*) FROM workflow_entity WHERE name = '${ESCAPED_NAME}';" 2>/dev/null | tr -d ' ' || echo "0")
-                
-                if [[ "${EXISTS}" != "0" ]]; then
-                    docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -c \
-                        "DELETE FROM workflow_entity WHERE name = '${ESCAPED_NAME}';" > /dev/null 2>&1
-                    ((DELETED_COUNT++)) || true
-                fi
-            fi
-        done <<< "${EXISTING_NAMES}"
+    if [[ "${DB_TYPE}" == "sqlite" ]]; then
+        local volume=$(get_n8n_volume_name)
+        # Delete all workflows
+        DELETED_COUNT=$(docker run --rm -v "${volume}:/data" alpine:latest sh -c \
+            "apk add --no-cache sqlite > /dev/null 2>&1 && \
+            if [ -f /data/.n8n/database.sqlite ]; then \
+                sqlite3 /data/.n8n/database.sqlite \"SELECT COUNT(*) FROM workflow_entity;\" 2>/dev/null; \
+            elif [ -f /data/database.sqlite ]; then \
+                sqlite3 /data/database.sqlite \"SELECT COUNT(*) FROM workflow_entity;\" 2>/dev/null; \
+            else \
+                echo '0'; \
+            fi" | tr -d ' ' || echo "0")
+        
+        if [[ "${DELETED_COUNT}" != "0" ]]; then
+            docker run --rm -v "${volume}:/data" alpine:latest sh -c \
+                "apk add --no-cache sqlite > /dev/null 2>&1 && \
+                if [ -f /data/.n8n/database.sqlite ]; then \
+                    sqlite3 /data/.n8n/database.sqlite \"DELETE FROM workflow_entity;\" 2>/dev/null; \
+                elif [ -f /data/database.sqlite ]; then \
+                    sqlite3 /data/database.sqlite \"DELETE FROM workflow_entity;\" 2>/dev/null; \
+                fi" > /dev/null 2>&1
+            log "Deleted ${DELETED_COUNT} existing workflow(s) to allow clean import"
+        fi
+    else
+        # PostgreSQL mode
+        DELETED_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
+            "SELECT COUNT(*) FROM workflow_entity;" 2>/dev/null | tr -d ' ' || echo "0")
+        
+        if [[ "${DELETED_COUNT}" != "0" ]]; then
+            docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -c \
+                "DELETE FROM workflow_entity;" > /dev/null 2>&1
+            log "Deleted ${DELETED_COUNT} existing workflow(s) to allow clean import"
+        fi
     fi
     
-    if [[ ${DELETED_COUNT} -gt 0 ]]; then
-        log "Deleted ${DELETED_COUNT} existing workflow(s) to allow re-import"
-    fi
-    
-    # Now import all workflows (they should all import successfully since duplicates are removed)
+    # Now import all workflows (they should all import successfully since we cleared everything)
     log "Importing workflows..."
     IMPORT_OUTPUT=$(docker exec "${container}" \
         n8n import:workflow --input=/tmp/workflows_to_import.json --separate 2>&1) || {
@@ -657,12 +635,12 @@ import_workflows() {
         exit 1
     }
     
-    # Log import output for debugging (only if there are warnings/errors)
-    if echo "${IMPORT_OUTPUT}" | grep -qiE "(error|warning|fail|skip)"; then
-        warning "Import output contains warnings/errors:"
+    # Always log import output for debugging
+    if [[ -n "${IMPORT_OUTPUT}" ]]; then
+        log "Import output:"
         echo "${IMPORT_OUTPUT}" | while IFS= read -r line; do
             if [[ -n "${line}" ]]; then
-                warning "  ${line}"
+                log "  ${line}"
             fi
         done
     fi
