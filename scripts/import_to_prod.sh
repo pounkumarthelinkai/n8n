@@ -564,14 +564,74 @@ import_workflows() {
     # Set proper ownership (n8n container typically runs as user 1000)
     docker exec "${container}" chown 1000:1000 /tmp/workflows_to_import.json 2>/dev/null || true
     
-    # Import workflows using n8n CLI
-    docker exec "${container}" \
-        n8n import:workflow --input=/tmp/workflows_to_import.json --separate || {
-            error "Failed to import workflows"
-            # Try to clean up with root user if needed
-            docker exec -u root "${container}" rm -f /tmp/workflows_to_import.json 2>/dev/null || true
-            exit 1
-        }
+    # Import workflows using n8n CLI with better error handling
+    log "Starting workflow import process..."
+    
+    # Get count before import for comparison
+    if [[ "${DB_TYPE}" == "sqlite" ]]; then
+        local volume=$(get_n8n_volume_name)
+        COUNT_BEFORE=$(docker run --rm -v "${volume}:/data" alpine:latest sh -c \
+            "apk add --no-cache sqlite > /dev/null 2>&1 && \
+            if [ -f /data/.n8n/database.sqlite ]; then \
+                sqlite3 /data/.n8n/database.sqlite \"SELECT COUNT(*) FROM workflow_entity;\" 2>/dev/null; \
+            elif [ -f /data/database.sqlite ]; then \
+                sqlite3 /data/database.sqlite \"SELECT COUNT(*) FROM workflow_entity;\" 2>/dev/null; \
+            else \
+                echo '0'; \
+            fi" | tr -d ' ' || echo "0")
+    else
+        COUNT_BEFORE=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
+            "SELECT COUNT(*) FROM workflow_entity;" 2>/dev/null | tr -d ' ' || echo "0")
+    fi
+    log "Workflows in PROD before import: ${COUNT_BEFORE}"
+    
+    # Capture import output to check for errors
+    IMPORT_OUTPUT=$(docker exec "${container}" \
+        n8n import:workflow --input=/tmp/workflows_to_import.json --separate 2>&1) || {
+        error "Failed to import workflows"
+        error "Import output: ${IMPORT_OUTPUT}"
+        # Try to clean up with root user if needed
+        docker exec -u root "${container}" rm -f /tmp/workflows_to_import.json 2>/dev/null || true
+        exit 1
+    }
+    
+    # Log import output for debugging (only if there are warnings/errors)
+    if echo "${IMPORT_OUTPUT}" | grep -qiE "(error|warning|fail|skip)"; then
+        warning "Import output contains warnings/errors:"
+        echo "${IMPORT_OUTPUT}" | while IFS= read -r line; do
+            if [[ -n "${line}" ]]; then
+                warning "  ${line}"
+            fi
+        done
+    fi
+    
+    # Verify import count matches expected
+    if [[ "${DB_TYPE}" == "sqlite" ]]; then
+        local volume=$(get_n8n_volume_name)
+        COUNT_AFTER=$(docker run --rm -v "${volume}:/data" alpine:latest sh -c \
+            "apk add --no-cache sqlite > /dev/null 2>&1 && \
+            if [ -f /data/.n8n/database.sqlite ]; then \
+                sqlite3 /data/.n8n/database.sqlite \"SELECT COUNT(*) FROM workflow_entity;\" 2>/dev/null; \
+            elif [ -f /data/database.sqlite ]; then \
+                sqlite3 /data/database.sqlite \"SELECT COUNT(*) FROM workflow_entity;\" 2>/dev/null; \
+            else \
+                echo '0'; \
+            fi" | tr -d ' ' || echo "0")
+    else
+        COUNT_AFTER=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
+            "SELECT COUNT(*) FROM workflow_entity;" 2>/dev/null | tr -d ' ' || echo "0")
+    fi
+    
+    ADDED_COUNT=$((COUNT_AFTER - COUNT_BEFORE))
+    log "Workflows in PROD after import: ${COUNT_AFTER} (added: ${ADDED_COUNT})"
+    
+    if [[ "${ADDED_COUNT}" -lt "${WORKFLOW_COUNT}" ]]; then
+        warning "Import count mismatch: Expected to add ${WORKFLOW_COUNT} workflows, but only ${ADDED_COUNT} were added"
+        warning "Some workflows may have failed to import, were skipped (possibly duplicates), or already existed"
+        warning "This is non-fatal - continuing with import process"
+    else
+        log "Verified: ${ADDED_COUNT} workflows added (expected ${WORKFLOW_COUNT})"
+    fi
     
     # Clean up from container (try as root user to ensure it works)
     docker exec -u root "${container}" rm -f /tmp/workflows_to_import.json 2>/dev/null || {
