@@ -838,6 +838,106 @@ PYTHON_SCRIPT
     log "Workflows activated successfully"
 }
 
+# Restore workflow ownership (assign to original owners)
+restore_workflow_ownership() {
+    log "Restoring workflow ownership to original owners..."
+    
+    if [[ ! -f "${WORKFLOWS_OWNER_MAP}" ]]; then
+        warning "Owner mapping not found - workflows will remain assigned to import user"
+        return
+    fi
+    
+    if [[ ! -f "${WORKFLOW_ID_MAP}" ]] || [[ ! -s "${WORKFLOW_ID_MAP}" ]]; then
+        warning "Workflow ID mapping not available - cannot restore ownership"
+        return
+    fi
+    
+    local container=$(get_n8n_container_name)
+    local volume=$(get_n8n_volume_name)
+    
+    # Use Python to process and restore ownership
+    python3 <<PYTHON_SCRIPT
+import sys
+import subprocess
+
+try:
+    # Read owner mapping from DEV
+    owner_map = {}
+    with open('${WORKFLOWS_OWNER_MAP}', 'r') as f:
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 2:
+                name, project_id = parts[0], parts[1]
+                if project_id:  # Only map if projectId exists
+                    owner_map[name] = project_id
+    
+    # Read workflow IDs from PROD
+    workflow_ids = {}
+    with open('${WORKFLOW_ID_MAP}', 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            # Try pipe separator first, then tab
+            if '|' in line:
+                parts = line.split('|', 1)
+            else:
+                parts = line.split('\t', 1)
+            if len(parts) >= 2:
+                name, workflow_id = parts[0].strip(), parts[1].strip()
+                workflow_ids[name] = workflow_id
+    
+    # Restore ownership
+    restored = 0
+    db_type = '${DB_TYPE}'
+    volume = '${volume}'
+    db_container = '${DB_CONTAINER}'
+    db_user = '${DB_USER}'
+    db_name = '${DB_NAME}'
+    
+    for name, project_id in owner_map.items():
+        if name in workflow_ids:
+            workflow_id = workflow_ids[name]
+            # Update database to set projectId
+            if db_type == 'sqlite':
+                cmd = [
+                    'docker', 'run', '--rm', '-v', f'{volume}:/data',
+                    'alpine:latest', 'sh', '-c',
+                    f"apk add --no-cache sqlite > /dev/null 2>&1 && "
+                    f"if [ -f /data/.n8n/database.sqlite ]; then "
+                    f"sqlite3 /data/.n8n/database.sqlite \"UPDATE workflow_entity SET projectId = '{project_id}' WHERE id = '{workflow_id}';\" 2>/dev/null; "
+                    f"elif [ -f /data/database.sqlite ]; then "
+                    f"sqlite3 /data/database.sqlite \"UPDATE workflow_entity SET projectId = '{project_id}' WHERE id = '{workflow_id}';\" 2>/dev/null; "
+                    f"fi"
+                ]
+            else:
+                cmd = [
+                    'docker', 'exec', db_container,
+                    'psql', '-U', db_user, '-d', db_name, '-c',
+                    f"UPDATE workflow_entity SET \"projectId\" = '{project_id}' WHERE id = '{workflow_id}';"
+                ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                print(f"Restored ownership: {name} -> projectId {project_id}")
+                restored += 1
+            else:
+                print(f"Failed to restore ownership: {name} - {result.stderr}", file=sys.stderr)
+    
+    print(f"Restored ownership for {restored} workflows")
+    
+except Exception as e:
+    print(f"Error restoring ownership: {e}", file=sys.stderr)
+    sys.exit(1)
+PYTHON_SCRIPT
+    
+    if [[ $? -ne 0 ]]; then
+        warning "Failed to restore some workflow ownership - workflows may be assigned to import user"
+        return 0  # Don't fail the entire import
+    fi
+    
+    log "Workflow ownership restored successfully"
+}
+
 # Toggle webhook workflows for registration
 toggle_webhook_workflows() {
     log "Toggling webhook-based workflows for registration..."

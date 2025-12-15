@@ -54,6 +54,7 @@ chmod 755 "${LOG_DIR}"
 WORKFLOWS_RAW="${EXPORT_DIR}/workflows_raw.json"
 WORKFLOWS_SANITIZED="${EXPORT_DIR}/workflows_sanitized.json"
 WORKFLOWS_ACTIVE_MAP="${EXPORT_DIR}/workflows_active_map.tsv"
+WORKFLOWS_OWNER_MAP="${EXPORT_DIR}/workflows_owner_map.tsv"
 CREDENTIALS_RAW="${EXPORT_DIR}/credentials_raw.json"
 CREDENTIALS_SELECTED="${EXPORT_DIR}/credentials_selected.json"
 CHECKSUMS_FILE="${EXPORT_DIR}/checksums.txt"
@@ -265,6 +266,16 @@ try:
             active = str(wf.get('active', False)).lower()
             wf_id = wf.get('id', '')
             f.write(f"{name}\t{active}\t{wf_id}\n")
+    
+    # Also create owner/project mapping
+    with open('${WORKFLOWS_OWNER_MAP}', 'w') as f:
+        for wf in workflows:
+            name = wf.get('name', 'Unknown')
+            project_id = wf.get('projectId', '')
+            # Get project name if available
+            project = wf.get('project', {})
+            project_name = project.get('name', '') if isinstance(project, dict) else ''
+            f.write(f"{name}\t{project_id}\t{project_name}\n")
 except Exception as e:
     print(f"Error creating active map: {e}", file=sys.stderr)
     sys.exit(1)
@@ -498,6 +509,9 @@ generate_checksums() {
     sha256sum workflows_sanitized.json > "${CHECKSUMS_FILE}"
     sha256sum credentials_selected.json >> "${CHECKSUMS_FILE}"
     sha256sum workflows_active_map.tsv >> "${CHECKSUMS_FILE}"
+    if [[ -f "${WORKFLOWS_OWNER_MAP}" ]]; then
+        sha256sum workflows_owner_map.tsv >> "${CHECKSUMS_FILE}"
+    fi
     
     log "Checksums generated"
     cat "${CHECKSUMS_FILE}" | tee -a "${LOG_FILE}"
@@ -541,6 +555,7 @@ create_export_package() {
         workflows_sanitized.json \
         credentials_selected.json \
         workflows_active_map.tsv \
+        workflows_owner_map.tsv \
         checksums.txt \
         export_metadata.json
     
