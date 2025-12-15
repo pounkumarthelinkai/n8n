@@ -588,13 +588,19 @@ create_workflow_id_mapping() {
     local container=$(get_n8n_container_name)
     
     if [[ "${DB_TYPE}" == "sqlite" ]]; then
-        # SQLite mode: query database file directly
-        docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
-            "SELECT name, id FROM workflow_entity ORDER BY name;" \
-            > "${WORKFLOW_ID_MAP}" 2>/dev/null || {
-            error "Failed to create workflow ID mapping from SQLite"
-            exit 1
-        }
+        # SQLite mode: query database file using temporary container
+        local volume=$(get_n8n_volume_name)
+        if docker run --rm -v "${volume}:/data" alpine:latest sh -c \
+            "apk add --no-cache sqlite > /dev/null 2>&1 && \
+            sqlite3 /data/database.sqlite \"SELECT name, id FROM workflow_entity ORDER BY name;\"" \
+            > "${WORKFLOW_ID_MAP}" 2>/dev/null; then
+            log "Workflow ID mapping created successfully"
+        else
+            warning "Failed to create workflow ID mapping from SQLite - workflows will remain inactive"
+            warning "You can activate workflows manually in the n8n UI"
+            # Create empty file so activation step can skip gracefully
+            touch "${WORKFLOW_ID_MAP}"
+        fi
     else
         # PostgreSQL mode
         docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -F$'\t' -c \
@@ -617,6 +623,12 @@ activate_workflows() {
         return
     fi
     
+    if [[ ! -f "${WORKFLOW_ID_MAP}" ]] || [[ ! -s "${WORKFLOW_ID_MAP}" ]]; then
+        warning "Workflow ID mapping not available - skipping activation"
+        warning "Workflows will remain inactive (you can activate them manually in n8n UI)"
+        return
+    fi
+    
     # Count active workflows in DEV
     ACTIVE_COUNT=$(grep -c $'\ttrue\t' "${WORKFLOWS_ACTIVE_MAP}" || echo "0")
     
@@ -629,6 +641,7 @@ activate_workflows() {
     
     # Use Python to process and activate
     local container=$(get_n8n_container_name)
+    local volume=$(get_n8n_volume_name)
     python3 <<PYTHON_SCRIPT
 import sys
 import subprocess
@@ -657,7 +670,7 @@ try:
     # Activate workflows
     activated = 0
     db_type = '${DB_TYPE}'
-    container = '${container}'
+    volume = '${volume}'
     db_container = '${DB_CONTAINER}'
     db_user = '${DB_USER}'
     db_name = '${DB_NAME}'
@@ -668,9 +681,10 @@ try:
             # Update database to set active=true
             if db_type == 'sqlite':
                 cmd = [
-                    'docker', 'exec', container,
-                    'sqlite3', '/home/node/.n8n/database.sqlite',
-                    f"UPDATE workflow_entity SET active = 1 WHERE id = '{workflow_id}';"
+                    'docker', 'run', '--rm', '-v', f'{volume}:/data',
+                    'alpine:latest', 'sh', '-c',
+                    f"apk add --no-cache sqlite > /dev/null 2>&1 && "
+                    f"sqlite3 /data/database.sqlite \"UPDATE workflow_entity SET active = 1 WHERE id = '{workflow_id}';\""
                 ]
             else:
                 cmd = [
@@ -695,8 +709,9 @@ except Exception as e:
 PYTHON_SCRIPT
     
     if [[ $? -ne 0 ]]; then
-        error "Failed to activate workflows"
-        exit 1
+        warning "Failed to activate some workflows - they will remain inactive"
+        warning "You can activate workflows manually in the n8n UI"
+        return 0  # Don't fail the entire import
     fi
     
     log "Workflows activated successfully"
@@ -710,9 +725,10 @@ toggle_webhook_workflows() {
     
     # Get list of active workflows with webhooks
     if [[ "${DB_TYPE}" == "sqlite" ]]; then
-        WEBHOOK_WORKFLOW_IDS=$(docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
-            "SELECT DISTINCT id FROM workflow_entity WHERE active = 1 AND nodes LIKE '%\"type\":\"n8n-nodes-base.webhook\"%';" \
-            2>/dev/null || echo "")
+        local volume=$(get_n8n_volume_name)
+        WEBHOOK_WORKFLOW_IDS=$(docker run --rm -v "${volume}:/data" alpine:latest sh -c \
+            "apk add --no-cache sqlite > /dev/null 2>&1 && \
+            sqlite3 /data/database.sqlite \"SELECT DISTINCT id FROM workflow_entity WHERE active = 1 AND nodes LIKE '%\\\"type\\\":\\\"n8n-nodes-base.webhook\\\"%';\" 2>/dev/null" || echo "")
     else
         WEBHOOK_WORKFLOW_IDS=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
             "SELECT DISTINCT w.id FROM workflow_entity w WHERE w.active = true AND w.nodes::text LIKE '%\"type\":\"n8n-nodes-base.webhook\"%';" \
@@ -731,13 +747,16 @@ toggle_webhook_workflows() {
     while IFS= read -r WORKFLOW_ID; do
         if [[ -n "${WORKFLOW_ID}" ]]; then
             if [[ "${DB_TYPE}" == "sqlite" ]]; then
+                local volume=$(get_n8n_volume_name)
                 # Deactivate
-                docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
-                    "UPDATE workflow_entity SET active = 0 WHERE id = '${WORKFLOW_ID}';" > /dev/null 2>&1
+                docker run --rm -v "${volume}:/data" alpine:latest sh -c \
+                    "apk add --no-cache sqlite > /dev/null 2>&1 && \
+                    sqlite3 /data/database.sqlite \"UPDATE workflow_entity SET active = 0 WHERE id = '${WORKFLOW_ID}';\" 2>/dev/null" > /dev/null 2>&1
                 sleep 1
                 # Reactivate
-                docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
-                    "UPDATE workflow_entity SET active = 1 WHERE id = '${WORKFLOW_ID}';" > /dev/null 2>&1
+                docker run --rm -v "${volume}:/data" alpine:latest sh -c \
+                    "apk add --no-cache sqlite > /dev/null 2>&1 && \
+                    sqlite3 /data/database.sqlite \"UPDATE workflow_entity SET active = 1 WHERE id = '${WORKFLOW_ID}';\" 2>/dev/null" > /dev/null 2>&1
             else
                 # Deactivate
                 docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -c \
@@ -764,17 +783,21 @@ verify_import() {
     log "Verifying import..."
     
     local container=$(get_n8n_container_name)
+    local volume=$(get_n8n_volume_name)
     
     # Count workflows in PROD
     if [[ "${DB_TYPE}" == "sqlite" ]]; then
-        PROD_WORKFLOW_COUNT=$(docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
-            "SELECT COUNT(*) FROM workflow_entity;" 2>/dev/null || echo "0")
+        PROD_WORKFLOW_COUNT=$(docker run --rm -v "${volume}:/data" alpine:latest sh -c \
+            "apk add --no-cache sqlite > /dev/null 2>&1 && \
+            sqlite3 /data/database.sqlite 'SELECT COUNT(*) FROM workflow_entity;' 2>/dev/null" | tr -d ' ' || echo "0")
         
-        PROD_ACTIVE_COUNT=$(docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
-            "SELECT COUNT(*) FROM workflow_entity WHERE active = 1;" 2>/dev/null || echo "0")
+        PROD_ACTIVE_COUNT=$(docker run --rm -v "${volume}:/data" alpine:latest sh -c \
+            "apk add --no-cache sqlite > /dev/null 2>&1 && \
+            sqlite3 /data/database.sqlite 'SELECT COUNT(*) FROM workflow_entity WHERE active = 1;' 2>/dev/null" | tr -d ' ' || echo "0")
         
-        PROD_CREDENTIAL_COUNT=$(docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
-            "SELECT COUNT(*) FROM credentials_entity;" 2>/dev/null || echo "0")
+        PROD_CREDENTIAL_COUNT=$(docker run --rm -v "${volume}:/data" alpine:latest sh -c \
+            "apk add --no-cache sqlite > /dev/null 2>&1 && \
+            sqlite3 /data/database.sqlite 'SELECT COUNT(*) FROM credentials_entity;' 2>/dev/null" | tr -d ' ' || echo "0")
     else
         PROD_WORKFLOW_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
             "SELECT COUNT(*) FROM workflow_entity;")
@@ -808,16 +831,20 @@ create_import_report() {
     log "Creating import report..."
     
     local container=$(get_n8n_container_name)
+    local volume=$(get_n8n_volume_name)
     
     if [[ "${DB_TYPE}" == "sqlite" ]]; then
-        PROD_WORKFLOW_COUNT=$(docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
-            "SELECT COUNT(*) FROM workflow_entity;" 2>/dev/null || echo "0")
+        PROD_WORKFLOW_COUNT=$(docker run --rm -v "${volume}:/data" alpine:latest sh -c \
+            "apk add --no-cache sqlite > /dev/null 2>&1 && \
+            sqlite3 /data/database.sqlite 'SELECT COUNT(*) FROM workflow_entity;' 2>/dev/null" | tr -d ' ' || echo "0")
         
-        PROD_ACTIVE_COUNT=$(docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
-            "SELECT COUNT(*) FROM workflow_entity WHERE active = 1;" 2>/dev/null || echo "0")
+        PROD_ACTIVE_COUNT=$(docker run --rm -v "${volume}:/data" alpine:latest sh -c \
+            "apk add --no-cache sqlite > /dev/null 2>&1 && \
+            sqlite3 /data/database.sqlite 'SELECT COUNT(*) FROM workflow_entity WHERE active = 1;' 2>/dev/null" | tr -d ' ' || echo "0")
         
-        PROD_CREDENTIAL_COUNT=$(docker exec "${container}" sqlite3 /home/node/.n8n/database.sqlite \
-            "SELECT COUNT(*) FROM credentials_entity;" 2>/dev/null || echo "0")
+        PROD_CREDENTIAL_COUNT=$(docker run --rm -v "${volume}:/data" alpine:latest sh -c \
+            "apk add --no-cache sqlite > /dev/null 2>&1 && \
+            sqlite3 /data/database.sqlite 'SELECT COUNT(*) FROM credentials_entity;' 2>/dev/null" | tr -d ' ' || echo "0")
     else
         PROD_WORKFLOW_COUNT=$(docker exec "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c \
             "SELECT COUNT(*) FROM workflow_entity;")
@@ -899,15 +926,42 @@ main() {
         
         # Check if package path is provided as argument
         if [[ $# -eq 0 ]]; then
-            error "Usage: $0 <path_to_export_package>"
-            error "Example: $0 /srv/n8n/migration-temp/n8n_export_20240101_120000.tar.gz"
-            error ""
-            error "For full database import, use:"
-            error "  $0 --full-db <path_to_dev_backup_file>"
-            exit 1
+            # Auto-fetch latest export from DEV
+            log "No package provided - fetching latest export from DEV..."
+            
+            DEV_VPS_HOST="194.238.17.118"
+            DEV_VPS_USER="root"
+            
+            # Find latest export package on DEV
+            LATEST_PACKAGE=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                "${DEV_VPS_USER}@${DEV_VPS_HOST}" \
+                "ls -t /srv/n8n/migration-temp/n8n_export_*.tar.gz 2>/dev/null | head -n1" || echo "")
+            
+            if [[ -z "${LATEST_PACKAGE}" ]]; then
+                error "No export package found on DEV VPS"
+                error "Please run export script on DEV first, or provide package path:"
+                error "  $0 /srv/n8n/migration-temp/n8n_export_YYYYMMDD_HHMMSS.tar.gz"
+                exit 1
+            fi
+            
+            PACKAGE_NAME=$(basename "${LATEST_PACKAGE}")
+            PACKAGE_PATH="${N8N_DIR}/migration-temp/${PACKAGE_NAME}"
+            
+            log "Found latest export: ${LATEST_PACKAGE}"
+            log "Copying to PROD..."
+            
+            # Copy package from DEV to PROD
+            scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                "${DEV_VPS_USER}@${DEV_VPS_HOST}:${LATEST_PACKAGE}" \
+                "${PACKAGE_PATH}" || {
+                error "Failed to copy package from DEV"
+                exit 1
+            }
+            
+            log "Package copied to: ${PACKAGE_PATH}"
+        else
+            PACKAGE_PATH="$1"
         fi
-        
-        PACKAGE_PATH="$1"
         
         extract_package "${PACKAGE_PATH}"
         verify_checksums

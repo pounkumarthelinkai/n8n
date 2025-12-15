@@ -1,0 +1,71 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+*.env
+config/env.dev
+config/env.prod
+
+# Sensitive files
+SETUP_SUMMARY.txt
+**/SETUP_SUMMARY.txt
+*_keys*.txt
+credential_allowlist.txt
+!config/credential_allowlist.txt
+!templates/credential_allowlist.txt
+
+# n8n data
+n8n-data/
+postgres-data/
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Backups
+backups/
+*.sql
+*.sql.gz
+*.sql.gz.sha256
+*.sql.gz.meta
+
+# Migration temporary files
+migration-temp/
+*.tar.gz
+export/
+import/
+
+# SSH keys
+*.pem
+*.key
+id_rsa*
+github_deploy_key*
+
+# OS files
+.DS_Store
+Thumbs.db
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Node modules (if any)
+node_modules/
+
+# Docker override files
+docker-compose.override.yml
+
+# Local configuration
+local.yml
+local.config.yml
+
