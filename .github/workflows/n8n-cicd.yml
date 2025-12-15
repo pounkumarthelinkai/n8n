@@ -1,4 +1,5 @@
 name: n8n CI/CD Pipeline
+# Updated: Fixed import script to handle duplicate workflows
 
 on:
   push:
