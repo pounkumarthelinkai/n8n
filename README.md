@@ -5,13 +5,19 @@ A complete CI/CD pipeline for n8n workflow automation, featuring automated deplo
 ## 🌟 Features
 
 - **Two-Environment Setup**: Separate DEV and PROD VPS instances
+- **Dual Transfer Modes**: 
+  - **Workflows-Only**: Export/import workflows and credentials (default)
+  - **Full Database**: Complete database transfer (workflows, credentials, users, history)
 - **Automated Export/Import**: Seamless workflow migration from DEV to PROD
 - **Secure Credential Management**: Credential allowlisting and encryption key separation
-- **GitHub Actions Integration**: Automated CI/CD with manual promotion control
+- **Automatic Encryption Key Sync**: Synchronizes encryption keys for credential decryption
+- **Corruption Prevention**: Safe SQLite backup using `.backup` command
+- **GitHub Actions Integration**: Automated CI/CD with transfer mode selection
 - **Database Backup & Restore**: Automated daily backups with rotation
 - **Health Monitoring**: Automated health checks and self-healing
 - **Workflow Activation Control**: Only activate workflows that were active in DEV
 - **Webhook Registration**: Automatic webhook re-registration on import
+- **Rollback Capability**: Automatic PROD backup before import for easy rollback
 
 ## 📋 Prerequisites
 
