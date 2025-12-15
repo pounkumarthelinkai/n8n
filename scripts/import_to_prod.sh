@@ -98,8 +98,13 @@ production_warning() {
 cleanup() {
     if [[ -d "${IMPORT_DIR}" ]]; then
         warning "Cleaning up sensitive files..."
-        # Remove decrypted credentials
-        rm -f "${CREDENTIALS_SELECTED}"
+        # Remove decrypted credentials (non-fatal if it fails)
+        rm -f "${CREDENTIALS_SELECTED}" 2>/dev/null || true
+        # Also try to clean up any container files if container is still running
+        local container=$(get_n8n_container_name 2>/dev/null || echo "")
+        if [[ -n "${container}" ]]; then
+            docker exec -u root "${container}" rm -f /tmp/credentials_to_import.json /tmp/workflows_to_import.json 2>/dev/null || true
+        fi
         # Keep reports and mappings for audit
     fi
 }
@@ -485,17 +490,23 @@ import_credentials() {
     # Copy credentials to container
     docker cp "${CREDENTIALS_SELECTED}" "${container}:/tmp/credentials_to_import.json"
     
+    # Set proper ownership (n8n container typically runs as user 1000)
+    docker exec "${container}" chown 1000:1000 /tmp/credentials_to_import.json 2>/dev/null || true
+    
     # Import credentials using n8n CLI (will re-encrypt with PROD key)
     source "${N8N_DIR}/.env"
     docker exec -e N8N_ENCRYPTION_KEY="${N8N_ENCRYPTION_KEY}" "${container}" \
         n8n import:credentials --input=/tmp/credentials_to_import.json || {
             error "Failed to import credentials"
-            docker exec "${container}" rm -f /tmp/credentials_to_import.json
+            # Try to clean up with root user if needed
+            docker exec -u root "${container}" rm -f /tmp/credentials_to_import.json 2>/dev/null || true
             exit 1
         }
     
-    # Clean up from container
-    docker exec "${container}" rm -f /tmp/credentials_to_import.json
+    # Clean up from container (try as root user to ensure it works)
+    docker exec -u root "${container}" rm -f /tmp/credentials_to_import.json 2>/dev/null || {
+        warning "Could not remove credentials file from container (non-critical)"
+    }
     
     log "Credentials imported and re-encrypted with PROD key"
 }
@@ -523,16 +534,22 @@ import_workflows() {
     # Copy workflows to container
     docker cp "${WORKFLOWS_SANITIZED}" "${container}:/tmp/workflows_to_import.json"
     
+    # Set proper ownership (n8n container typically runs as user 1000)
+    docker exec "${container}" chown 1000:1000 /tmp/workflows_to_import.json 2>/dev/null || true
+    
     # Import workflows using n8n CLI
     docker exec "${container}" \
         n8n import:workflow --input=/tmp/workflows_to_import.json --separate || {
             error "Failed to import workflows"
-            docker exec "${container}" rm -f /tmp/workflows_to_import.json
+            # Try to clean up with root user if needed
+            docker exec -u root "${container}" rm -f /tmp/workflows_to_import.json 2>/dev/null || true
             exit 1
         }
     
-    # Clean up from container
-    docker exec "${container}" rm -f /tmp/workflows_to_import.json
+    # Clean up from container (try as root user to ensure it works)
+    docker exec -u root "${container}" rm -f /tmp/workflows_to_import.json 2>/dev/null || {
+        warning "Could not remove workflows file from container (non-critical)"
+    }
     
     log "Workflows imported successfully (all inactive)"
 }
