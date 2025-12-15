@@ -592,7 +592,14 @@ create_workflow_id_mapping() {
         local volume=$(get_n8n_volume_name)
         if docker run --rm -v "${volume}:/data" alpine:latest sh -c \
             "apk add --no-cache sqlite > /dev/null 2>&1 && \
-            sqlite3 /data/database.sqlite \"SELECT name, id FROM workflow_entity ORDER BY name;\"" \
+            if [ -f /data/.n8n/database.sqlite ]; then \
+                sqlite3 /data/.n8n/database.sqlite \"SELECT name, id FROM workflow_entity ORDER BY name;\" 2>/dev/null; \
+            elif [ -f /data/database.sqlite ]; then \
+                sqlite3 /data/database.sqlite \"SELECT name, id FROM workflow_entity ORDER BY name;\" 2>/dev/null; \
+            else \
+                echo 'Error: database.sqlite not found' >&2; \
+                exit 1; \
+            fi" \
             > "${WORKFLOW_ID_MAP}" 2>/dev/null; then
             log "Workflow ID mapping created successfully"
         else
